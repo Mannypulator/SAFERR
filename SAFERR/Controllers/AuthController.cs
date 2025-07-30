@@ -22,7 +22,7 @@ namespace SAFERR.Controllers
         private readonly IBrandRepository _brandRepository; // To create/get brand
         private readonly IPasswordHasher _passwordHasher;
         private readonly ILogger<AuthController> _logger;
-        private readonly JwtSettings _jwtSettings; // Injected settings
+        // private readonly JwtSettings _jwtSettings; // Injected settings
         private readonly ApplicationDbContext _context;
 
         public AuthController(
@@ -30,14 +30,15 @@ namespace SAFERR.Controllers
             IBrandRepository brandRepository,
             IPasswordHasher passwordHasher,
             ILogger<AuthController> logger,
-            IOptions<JwtSettings> jwtOptions, ApplicationDbContext context) // Inject settings
+            // IOptions<JwtSettings> jwtOptions, 
+            ApplicationDbContext context) // Inject settings
         {
             _userRepository = userRepository;
             _brandRepository = brandRepository;
             _passwordHasher = passwordHasher;
             _logger = logger;
             _context = context;
-            _jwtSettings = jwtOptions.Value;
+            // _jwtSettings = jwtOptions.Value;
         }
 
         [HttpPost("login")]
@@ -174,7 +175,7 @@ namespace SAFERR.Controllers
         private AuthResponseModel GenerateJwtToken(User user)
         {
             var tokenHandler = new JwtSecurityTokenHandler();
-            var key = Encoding.ASCII.GetBytes(_jwtSettings.Key);
+            var key = Encoding.ASCII.GetBytes(Environment.GetEnvironmentVariable("JWT_SECRET_KEY"));
             var tokenDescriptor = new SecurityTokenDescriptor
             {
                 Subject = new ClaimsIdentity(new[]
@@ -184,9 +185,9 @@ namespace SAFERR.Controllers
                     new Claim("BrandId", user.BrandId.ToString()), // Custom claim for BrandId
                     // Add roles if needed: new Claim(ClaimTypes.Role, "BrandAdmin")
                 }),
-                Expires = DateTime.UtcNow.AddMinutes(_jwtSettings.ExpireMinutes),
-                Issuer = _jwtSettings.Issuer,
-                Audience = _jwtSettings.Audience,
+                Expires = DateTime.UtcNow.AddMinutes(int.Parse(Environment.GetEnvironmentVariable("JWT_EXPIRE_MINUTES"))),
+                Issuer =  Environment.GetEnvironmentVariable("JWT_ISSUER"),
+                Audience = Environment.GetEnvironmentVariable("JWT_AUDIENCE"),
                 SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(key), SecurityAlgorithms.HmacSha256Signature)
             };
             var token = tokenHandler.CreateToken(tokenDescriptor);
