@@ -303,6 +303,9 @@ public class SecurityCodeService : ISecurityCodeService
                 _logger.Information(
                     "Verification result: Already Verified. Code ID: {CodeId}, Product ID: {ProductId}, Brand ID: {BrandId}.",
                     securityCode.Id, securityCode.ProductId, brandIdForVerification);
+
+                resultDto.Result = VerificationResult.AlreadyVerified;
+                resultDto.Message = "Verification result: Already Verified.";
             }
             else
             {
