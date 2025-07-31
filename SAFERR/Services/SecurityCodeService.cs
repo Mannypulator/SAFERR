@@ -10,6 +10,7 @@ namespace SAFERR.Services;
 public class SecurityCodeService : ISecurityCodeService
 {
     private readonly ISecurityCodeRepository _securityCodeRepository;
+
     // private readonly TwilioSettings _twilioSettings;
     private readonly IBrandRepository _brandRepository; // Add if not already present
     private readonly IBrandSubscriptionRepository _brandSubscriptionRepository; // Add
@@ -77,80 +78,115 @@ public class SecurityCodeService : ISecurityCodeService
     public async Task<List<string>> GenerateCodesForProductAsync(Guid productId, int count)
     {
         _logger.Information("Initiating generation of {Count} codes for Product ID {ProductId}.", count, productId);
-        // 1. Get Product and Brand
+
+        // 1. Basic Validation
+        if (count <= 0)
+        {
+            var errorMsg = "Code generation count must be greater than zero.";
+            _logger.Information("Invalid request: {ErrorMessage} for Product ID {ProductId}.", errorMsg, productId);
+            throw new ArgumentException(errorMsg, nameof(count));
+        }
+
+        if (count > 10000) // Example hard limit, adjust as needed
+        {
+            var errorMsg = "Maximum code generation count is 10,000 per request.";
+            _logger.Information("Invalid request: {ErrorMessage} for Product ID {ProductId}.", errorMsg, productId);
+            throw new ArgumentException(errorMsg, nameof(count));
+        }
+
+        // 2. Fetch and Validate Product & Brand Association
         var product = await _productRepository.GetByIdAsync(productId);
         if (product == null)
         {
-            throw new ArgumentException("Product not found.", nameof(productId));
+            var errorMsg = "Product not found for code generation.";
+            _logger.Information(errorMsg + " Product ID: {ProductId}.", productId);
+            throw new ArgumentException(errorMsg, nameof(productId));
         }
 
-        // 2. Check Subscription Permission for Code Generation
+        // 3. Subscription Check (Placeholder - implement based on your subscription logic)
+        // This part depends on how subscription limits are enforced.
+        // Example: Check if the brand associated with the product has quota.
         // var (isAllowed, message) = await CheckCodeGenerationPermissionAsync(product.BrandId, count);
         // if (!isAllowed)
         // {
+        //     _logger.LogWarning(
+        //         "Subscription check failed for code generation. Brand ID: {BrandId}, Product ID: {ProductId}, Count: {Count}. Reason: {Reason}",
+        //         product.BrandId, productId, count, message);
         //     throw new InvalidOperationException($"Subscription check failed: {message}");
         // }
+        // _logger.LogDebug("Subscription check passed for Brand ID {BrandId}.", product.BrandId);
 
-        // 3. Proceed with existing code generation logic...
+        // 4. --- Core Code Generation Logic ---
         var generatedCodes = new List<string>();
-        var securityCodesToInsert = new List<SecurityCode>();
+        var securityCodesToInsert = new List<SecurityCode>(); // List to hold entities for DB insertion
         var failedAttempts = 0;
-        int maxFailedAttemptsPerBatch = count * 10;
+        int maxFailedAttemptsPerBatch = count * 10; // Reasonable buffer for collision retries
 
+        // Use a simple loop with retry logic for uniqueness
         while (generatedCodes.Count < count && failedAttempts < maxFailedAttemptsPerBatch)
         {
-            // Generate a slightly larger batch in memory
-            int batchSize = Math.Min(1000, count - generatedCodes.Count + 100); // Generate a bit extra
-            var candidateBatch = new HashSet<string>(); // Use HashSet for fast in-memory duplicate check
+            var code = GenerateRandomCode(CodeLength);
 
-            while (candidateBatch.Count < batchSize)
+            // Check for uniqueness in the CURRENT BATCH being generated *AND* in the DATABASE
+            // Using repository method for DB check is important.
+            if (!generatedCodes.Contains(code) && !await _securityCodeRepository.CodeExistsAsync(code))
             {
-                var code = GenerateRandomCode(CodeLength);
-                // Add to HashSet (automatically handles in-memory uniqueness)
-                candidateBatch.Add(code);
-            }
-
-            // Now, check this *entire batch* against the database for uniqueness
-            var existingCodesInDb = await _securityCodeRepository.FindExistingCodesAsync(candidateBatch);
-            var uniqueCandidates = candidateBatch.Except(existingCodesInDb);
-
-            // Add the truly unique candidates to our final list
-            foreach (var uniqueCode in uniqueCandidates)
-            {
-                if (generatedCodes.Count < count)
+                generatedCodes.Add(code);
+                // Create the SecurityCode entity to be saved
+                var securityCodeEntity = new SecurityCode
                 {
-                    generatedCodes.Add(uniqueCode);
-                }
+                    Code = code,
+                    ProductId = productId,
+                    CreatedAt = DateTime.UtcNow
+                    // IsApplied, IsVerified, FirstVerifiedAt default to false/DateTime.Min
+                };
+                securityCodesToInsert.Add(securityCodeEntity); // Add to list for bulk insert
             }
-
-            failedAttempts += candidateBatch.Count - uniqueCandidates.Count(); // Count of duplicates found
-            _logger.Debug("Generated batch of {BatchSize} candidates. {UniqueCount} were unique and added. Total generated: {TotalGenerated}/{RequestedCount}", candidateBatch.Count, uniqueCandidates.Count(), generatedCodes.Count, count);
+            else
+            {
+                failedAttempts++;
+                _logger.Information(
+                    "Code generation collision detected. Failed attempts: {FailedAttempts}/{MaxAttempts}",
+                    failedAttempts, maxFailedAttemptsPerBatch);
+            }
         }
 
         if (generatedCodes.Count != count)
         {
-            _logger.Error("Failed to generate {RequestedCount} unique codes for product {ProductId} after {FailedAttempts} collisions.", count, productId, failedAttempts);
-            throw new InvalidOperationException($"Could not generate {count} unique codes due to excessive collisions.");
+            _logger.Error(
+                "Failed to generate {RequestedCount} unique codes for product {ProductId} after {FailedAttempts} collisions.",
+                count, productId, failedAttempts);
+            throw new InvalidOperationException(
+                $"Could not generate {count} unique codes due to excessive collisions.");
         }
+        // --- End Core Code Generation Logic ---
 
-        // 4. Bulk insert codes
-        await _securityCodeRepository.AddRangeAsync(securityCodesToInsert);
-        await _securityCodeRepository.SaveChangesAsync();
+        // 5. --- Persist Generated Codes to Database ---
+        try
+        {
+            // Use AddRangeAsync for efficient bulk insertion if supported by your repository
+            // Otherwise, loop and use AddAsync, but AddRangeAsync is preferred.
+            await _securityCodeRepository.AddRangeAsync(securityCodesToInsert);
 
-        // 5. Update subscription usage for codes generated
-        // var currentSubscription = await _brandSubscriptionRepository.GetCurrentSubscriptionForBrandAsync(product.BrandId);
-        // if (currentSubscription != null)
-        // {
-        //     await _brandSubscriptionRepository.UpdateUsageAsync(currentSubscription.Id, codesGeneratedDelta: count);
-        //     // Note: SaveChangesAsync is called inside UpdateUsageAsync (via ExecuteSqlRaw) or needs to be called here
-        //     // if UpdateUsageAsync was modified to use entity tracking. Current impl with ExecuteSqlRaw is atomic.
-        // }
+            // IMPORTANT: This is the crucial step that was likely missing or incorrectly implemented before.
+            // SaveChangesAsync commits the added entities to the database.
+            await _securityCodeRepository.SaveChangesAsync();
 
-        _logger.Information("Generated {Count} codes for product {ProductId}.", count, productId);
-        return generatedCodes;
+            _logger.Information("Successfully generated and stored {Count} codes for Product ID {ProductId}.", count,
+                productId);
+            return generatedCodes;
+        }
+        catch (Exception ex) // Catch database errors, etc.
+        {
+            _logger.Error(ex,
+                "An error occurred while saving {Count} generated codes for Product ID {ProductId} to the database.",
+                count, productId);
+            // Consider: Should partially generated codes be usable if save fails?
+            // Current approach: Fail the whole operation if persistence fails.
+            throw new InvalidOperationException(
+                "Codes were generated but failed to save to the database. Please try again.", ex);
+        }
     }
-
-
 
 
     /// <summary>
@@ -160,159 +196,176 @@ public class SecurityCodeService : ISecurityCodeService
     /// <param name="sourcePhoneNumber">Optional: Source phone number for logging.</param>
     /// <param name="sourceIpAddress">Optional: Source IP address for logging.</param>
     /// <returns>The verification result.</returns>
-    public async Task<VerificationResultDto> VerifyCodeAsync(string codeInput, string? sourcePhoneNumber = null, string? sourceIpAddress = null)
+    public async Task<VerificationResultDto> VerifyCodeAsync(string codeInput, string? sourcePhoneNumber = null,
+        string? sourceIpAddress = null)
+    {
+        // --- Performance: Start timing ---
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        string? logCodeId = null; // Capture for logging duration
+        // --------------------------------
+
+        _logger.Information(
+            "Processing verification request. Code Input: '{CodeInput}', Source Phone: {SourcePhone}, Source IP: {SourceIp}",
+            codeInput, sourcePhoneNumber ?? "N/A", sourceIpAddress ?? "N/A");
+
+        var resultDto = new VerificationResultDto
         {
-            // --- Performance: Start timing ---
-            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-            string? logCodeId = null; // Capture for logging duration
-            // --------------------------------
+            Result = VerificationResult.Error,
+            Message = "An error occurred during verification."
+        };
 
-            _logger.Information(
-                "Processing verification request. Code Input: '{CodeInput}', Source Phone: {SourcePhone}, Source IP: {SourceIp}",
-                codeInput, sourcePhoneNumber ?? "N/A", sourceIpAddress ?? "N/A");
-
-            var resultDto = new VerificationResultDto
-            {
-                Result = VerificationResult.Error,
-                Message = "An error occurred during verification."
-            };
-
-            if (string.IsNullOrWhiteSpace(codeInput))
-            {
-                resultDto.Result = VerificationResult.InvalidCodeFormat;
-                resultDto.Message = "Invalid code format.";
-                _logger.Warning("Verification failed due to invalid code format. Input: '{CodeInput}'.", codeInput);
-                await LogVerificationAttempt(codeInput, resultDto.Result, sourcePhoneNumber, sourceIpAddress, null);
-                stopwatch.Stop();
-                _logger.Debug("Verification process (Invalid Format) took {ElapsedMilliseconds} ms.", stopwatch.ElapsedMilliseconds);
-                return resultDto;
-            }
-
-            SecurityCode? securityCode = null;
-            try
-            {
-                // --- Performance: Direct DB Call (if repository method isn't optimized) ---
-                // Ensure _securityCodeRepository.GetByCodeValueAsync is efficient (uses index)
-                securityCode = await _securityCodeRepository.GetByCodeValueAsync(codeInput.Trim());
-                // ------------------------------------------------------------------------
-            }
-            catch (Exception ex)
-            {
-                 _logger.Error(ex, "Database error occurred while looking up code '{CodeInput}'.", codeInput);
-                 resultDto.Message = "A temporary error occurred. Please try again.";
-                 await LogVerificationAttempt(codeInput, VerificationResult.Error, sourcePhoneNumber, sourceIpAddress, null);
-                 stopwatch.Stop();
-                 _logger.Debug("Verification process (DB Error) took {ElapsedMilliseconds} ms.", stopwatch.ElapsedMilliseconds);
-                 return resultDto;
-            }
-
-            if (securityCode == null)
-            {
-                resultDto.Result = VerificationResult.Counterfeit;
-                resultDto.Message = "This code is not recognized. The product may be counterfeit.";
-                _logger.Information("Verification result: Counterfeit. Code '{CodeInput}' not found.", codeInput);
-                await LogVerificationAttempt(codeInput, resultDto.Result, sourcePhoneNumber, sourceIpAddress, null);
-                stopwatch.Stop();
-                _logger.Debug("Verification process (Counterfeit) took {ElapsedMilliseconds} ms.", stopwatch.ElapsedMilliseconds);
-                return resultDto;
-            }
-
-            logCodeId = securityCode.Id.ToString(); // Capture ID for duration log
-
-            // --- Subscription Check (now cached) ---
-            Guid brandIdForVerification = securityCode.Product?.BrandId ?? Guid.Empty;
-            if (brandIdForVerification == Guid.Empty)
-            {
-                 _logger.Warning("Security code {CodeId} is not associated with a valid product/brand.", securityCode.Id);
-                 resultDto.Result = VerificationResult.Error;
-                 resultDto.Message = "Unable to verify subscription status for this product. Please contact support.";
-                 await LogVerificationAttempt(codeInput, resultDto.Result, sourcePhoneNumber, sourceIpAddress, securityCode.Id);
-                 stopwatch.Stop();
-                 _logger.Debug("Verification process (No Brand Link) took {ElapsedMilliseconds} ms.", stopwatch.ElapsedMilliseconds);
-                 return resultDto;
-            }
-
-            var (isAllowed, message) = await CheckVerificationPermissionAsync(brandIdForVerification);
-            if (!isAllowed)
-            {
-                _logger.Warning(
-                    "Verification blocked due to subscription limit. Code: '{CodeInput}', Brand ID: {BrandId}. Reason: {Reason}",
-                    codeInput, brandIdForVerification, message);
-                resultDto.Result = VerificationResult.Error;
-                resultDto.Message = $"Verification blocked: {message}";
-                await LogVerificationAttempt(codeInput, resultDto.Result, sourcePhoneNumber, sourceIpAddress, securityCode.Id);
-                stopwatch.Stop();
-                _logger.Debug("Verification process (Subscription Blocked) took {ElapsedMilliseconds} ms.", stopwatch.ElapsedMilliseconds);
-                return resultDto;
-            }
-            // ---------------------------------------
-
-            // ... existing verification logic (checking IsVerified, etc.) ...
-
-            try
-            {
-                // ... verification logic ...
-
-                if (securityCode.IsVerified)
-                {
-                    // ... AlreadyVerified logic ...
-                    _logger.Information(
-                        "Verification result: Already Verified. Code ID: {CodeId}, Product ID: {ProductId}, Brand ID: {BrandId}.",
-                        securityCode.Id, securityCode.ProductId, brandIdForVerification);
-                }
-                else
-                {
-                    // ... Genuine logic ...
-                     _logger.Information(
-                        "Verification result: Genuine. Code ID: {CodeId}, Product ID: {ProductId}, Brand ID: {BrandId}.",
-                        securityCode.Id, securityCode.ProductId, brandIdForVerification);
-
-                    // ... update code ...
-                    await _securityCodeRepository.SaveChangesAsync();
-                }
-
-                // ... log verification attempt ...
-                await LogVerificationAttempt(codeInput, resultDto.Result, sourcePhoneNumber, sourceIpAddress, securityCode.Id);
-
-                // --- Usage Update (now cached) ---
-                if (resultDto.Result == VerificationResult.Genuine || resultDto.Result == VerificationResult.AlreadyVerified)
-                {
-                    // The repository's UpdateUsageAsync now handles cache invalidation
-                    var currentSubscription = await _brandSubscriptionRepository.GetCurrentSubscriptionForBrandAsync(brandIdForVerification);
-                    if (currentSubscription != null)
-                    {
-                        await _brandSubscriptionRepository.UpdateUsageAsync(currentSubscription.Id, verificationsReceivedDelta: 1);
-                    }
-                }
-                // ----------------------------------
-
-                stopwatch.Stop();
-                _logger.Debug("Verification process (Success: {Result}) for Code ID {CodeId} took {ElapsedMilliseconds} ms.", resultDto.Result, logCodeId, stopwatch.ElapsedMilliseconds);
-                
-                // --- Performance Check ---
-                if (stopwatch.ElapsedMilliseconds > 3000) // Log if approaching 5s SLA
-                {
-                     _logger.Warning("Slow verification detected. Result: {Result}, Code ID: {CodeId}, Duration: {ElapsedMilliseconds} ms.", resultDto.Result, logCodeId, stopwatch.ElapsedMilliseconds);
-                }
-                // -------------------------
-
-                return resultDto;
-            }
-            catch (Exception ex)
-            {
-                 _logger.Error(ex,
-                     "An error occurred while finalizing verification for code '{CodeInput}' (Code ID: {CodeId}).",
-                     codeInput, securityCode.Id);
-                 resultDto.Result = VerificationResult.Error;
-                 resultDto.Message = "An error occurred while processing your verification. Please try again.";
-                 await LogVerificationAttempt(codeInput, resultDto.Result, sourcePhoneNumber, sourceIpAddress, securityCode.Id);
-                 
-                 stopwatch.Stop();
-                 _logger.Debug("Verification process (Finalization Error) took {ElapsedMilliseconds} ms.", stopwatch.ElapsedMilliseconds);
-                 return resultDto;
-            }
+        if (string.IsNullOrWhiteSpace(codeInput))
+        {
+            resultDto.Result = VerificationResult.InvalidCodeFormat;
+            resultDto.Message = "Invalid code format.";
+            _logger.Warning("Verification failed due to invalid code format. Input: '{CodeInput}'.", codeInput);
+            await LogVerificationAttempt(codeInput, resultDto.Result, sourcePhoneNumber, sourceIpAddress, null);
+            stopwatch.Stop();
+            _logger.Debug("Verification process (Invalid Format) took {ElapsedMilliseconds} ms.",
+                stopwatch.ElapsedMilliseconds);
+            return resultDto;
         }
 
+        SecurityCode? securityCode = null;
+        try
+        {
+            // --- Performance: Direct DB Call (if repository method isn't optimized) ---
+            // Ensure _securityCodeRepository.GetByCodeValueAsync is efficient (uses index)
+            securityCode = await _securityCodeRepository.GetByCodeValueAsync(codeInput.Trim());
+            // ------------------------------------------------------------------------
+        }
+        catch (Exception ex)
+        {
+            _logger.Error(ex, "Database error occurred while looking up code '{CodeInput}'.", codeInput);
+            resultDto.Message = "A temporary error occurred. Please try again.";
+            await LogVerificationAttempt(codeInput, VerificationResult.Error, sourcePhoneNumber, sourceIpAddress, null);
+            stopwatch.Stop();
+            _logger.Debug("Verification process (DB Error) took {ElapsedMilliseconds} ms.",
+                stopwatch.ElapsedMilliseconds);
+            return resultDto;
+        }
+
+        if (securityCode == null)
+        {
+            resultDto.Result = VerificationResult.Counterfeit;
+            resultDto.Message = "This code is not recognized. The product may be counterfeit.";
+            _logger.Information("Verification result: Counterfeit. Code '{CodeInput}' not found.", codeInput);
+            await LogVerificationAttempt(codeInput, resultDto.Result, sourcePhoneNumber, sourceIpAddress, null);
+            stopwatch.Stop();
+            _logger.Debug("Verification process (Counterfeit) took {ElapsedMilliseconds} ms.",
+                stopwatch.ElapsedMilliseconds);
+            return resultDto;
+        }
+
+        logCodeId = securityCode.Id.ToString(); // Capture ID for duration log
+
+        // --- Subscription Check (now cached) ---
+        Guid brandIdForVerification = securityCode.Product?.BrandId ?? Guid.Empty;
+        if (brandIdForVerification == Guid.Empty)
+        {
+            _logger.Warning("Security code {CodeId} is not associated with a valid product/brand.", securityCode.Id);
+            resultDto.Result = VerificationResult.Error;
+            resultDto.Message = "Unable to verify subscription status for this product. Please contact support.";
+            await LogVerificationAttempt(codeInput, resultDto.Result, sourcePhoneNumber, sourceIpAddress,
+                securityCode.Id);
+            stopwatch.Stop();
+            _logger.Debug("Verification process (No Brand Link) took {ElapsedMilliseconds} ms.",
+                stopwatch.ElapsedMilliseconds);
+            return resultDto;
+        }
+
+        var (isAllowed, message) = await CheckVerificationPermissionAsync(brandIdForVerification);
+        if (!isAllowed)
+        {
+            _logger.Warning(
+                "Verification blocked due to subscription limit. Code: '{CodeInput}', Brand ID: {BrandId}. Reason: {Reason}",
+                codeInput, brandIdForVerification, message);
+            resultDto.Result = VerificationResult.Error;
+            resultDto.Message = $"Verification blocked: {message}";
+            await LogVerificationAttempt(codeInput, resultDto.Result, sourcePhoneNumber, sourceIpAddress,
+                securityCode.Id);
+            stopwatch.Stop();
+            _logger.Debug("Verification process (Subscription Blocked) took {ElapsedMilliseconds} ms.",
+                stopwatch.ElapsedMilliseconds);
+            return resultDto;
+        }
+        // ---------------------------------------
+
+        // ... existing verification logic (checking IsVerified, etc.) ...
+
+        try
+        {
+            // ... verification logic ...
+
+            if (securityCode.IsVerified)
+            {
+                // ... AlreadyVerified logic ...
+                _logger.Information(
+                    "Verification result: Already Verified. Code ID: {CodeId}, Product ID: {ProductId}, Brand ID: {BrandId}.",
+                    securityCode.Id, securityCode.ProductId, brandIdForVerification);
+            }
+            else
+            {
+                // ... Genuine logic ...
+                _logger.Information(
+                    "Verification result: Genuine. Code ID: {CodeId}, Product ID: {ProductId}, Brand ID: {BrandId}.",
+                    securityCode.Id, securityCode.ProductId, brandIdForVerification);
+
+                // ... update code ...
+                await _securityCodeRepository.SaveChangesAsync();
+            }
+
+            // ... log verification attempt ...
+            await LogVerificationAttempt(codeInput, resultDto.Result, sourcePhoneNumber, sourceIpAddress,
+                securityCode.Id);
+
+            // --- Usage Update (now cached) ---
+            if (resultDto.Result == VerificationResult.Genuine ||
+                resultDto.Result == VerificationResult.AlreadyVerified)
+            {
+                // The repository's UpdateUsageAsync now handles cache invalidation
+                var currentSubscription =
+                    await _brandSubscriptionRepository.GetCurrentSubscriptionForBrandAsync(brandIdForVerification);
+                if (currentSubscription != null)
+                {
+                    await _brandSubscriptionRepository.UpdateUsageAsync(currentSubscription.Id,
+                        verificationsReceivedDelta: 1);
+                }
+            }
+            // ----------------------------------
+
+            stopwatch.Stop();
+            _logger.Debug(
+                "Verification process (Success: {Result}) for Code ID {CodeId} took {ElapsedMilliseconds} ms.",
+                resultDto.Result, logCodeId, stopwatch.ElapsedMilliseconds);
+
+            // --- Performance Check ---
+            if (stopwatch.ElapsedMilliseconds > 3000) // Log if approaching 5s SLA
+            {
+                _logger.Warning(
+                    "Slow verification detected. Result: {Result}, Code ID: {CodeId}, Duration: {ElapsedMilliseconds} ms.",
+                    resultDto.Result, logCodeId, stopwatch.ElapsedMilliseconds);
+            }
+            // -------------------------
+
+            return resultDto;
+        }
+        catch (Exception ex)
+        {
+            _logger.Error(ex,
+                "An error occurred while finalizing verification for code '{CodeInput}' (Code ID: {CodeId}).",
+                codeInput, securityCode.Id);
+            resultDto.Result = VerificationResult.Error;
+            resultDto.Message = "An error occurred while processing your verification. Please try again.";
+            await LogVerificationAttempt(codeInput, resultDto.Result, sourcePhoneNumber, sourceIpAddress,
+                securityCode.Id);
+
+            stopwatch.Stop();
+            _logger.Debug("Verification process (Finalization Error) took {ElapsedMilliseconds} ms.",
+                stopwatch.ElapsedMilliseconds);
+            return resultDto;
+        }
+    }
 
 
     /// <summary>
@@ -355,13 +408,15 @@ public class SecurityCodeService : ISecurityCodeService
             if (messageResource.Status.ToString().Equals("sent", StringComparison.OrdinalIgnoreCase) ||
                 messageResource.Status.ToString().Equals("queued", StringComparison.OrdinalIgnoreCase))
             {
-                _logger.Information("SMS sent successfully to {ToPhoneNumber}. SID: {MessageSid}", toPhoneNumber, messageResource.Sid);
+                _logger.Information("SMS sent successfully to {ToPhoneNumber}. SID: {MessageSid}", toPhoneNumber,
+                    messageResource.Sid);
                 return true;
             }
             else
             {
-                _logger.Warning("SMS sending failed or pending for {ToPhoneNumber}. Status: {Status}, ErrorCode: {ErrorCode}",
-                                   toPhoneNumber, messageResource.Status, messageResource.ErrorCode);
+                _logger.Warning(
+                    "SMS sending failed or pending for {ToPhoneNumber}. Status: {Status}, ErrorCode: {ErrorCode}",
+                    toPhoneNumber, messageResource.Status, messageResource.ErrorCode);
                 return false;
             }
         }
@@ -374,7 +429,6 @@ public class SecurityCodeService : ISecurityCodeService
 
     public async Task<VerificationTrendDto> GetVerificationTrendAsync(DateTime startDate, DateTime endDate)
     {
-
         var logsInPeriod = await _verificationLogRepository
             .FindAsync(v => v.VerificationAttemptedAt >= startDate && v.VerificationAttemptedAt <= endDate);
 
@@ -424,7 +478,8 @@ public class SecurityCodeService : ISecurityCodeService
     //     };
     // }
 
-    public async Task<(bool IsAllowed, string Message)> CheckCodeGenerationPermissionAsync(Guid brandId, int requestedCount)
+    public async Task<(bool IsAllowed, string Message)> CheckCodeGenerationPermissionAsync(Guid brandId,
+        int requestedCount)
     {
         var brand = await _brandRepository.GetByIdAsync(brandId);
         if (brand == null)
@@ -442,7 +497,8 @@ public class SecurityCodeService : ISecurityCodeService
         var plan = currentSubscription.SubscriptionPlan;
         if (plan == null)
         {
-            _logger.Error("Subscription {SubscriptionId} for brand {BrandId} has no associated plan.", currentSubscription.Id, brandId);
+            _logger.Error("Subscription {SubscriptionId} for brand {BrandId} has no associated plan.",
+                currentSubscription.Id, brandId);
             return (false, "Subscription plan details are missing. Please contact support.");
         }
 
@@ -450,7 +506,8 @@ public class SecurityCodeService : ISecurityCodeService
         if (plan.MaxCodesPerMonth != -1 && // -1 means unlimited
             (currentSubscription.CodesGenerated + requestedCount) > plan.MaxCodesPerMonth)
         {
-            return (false, $"Code generation limit exceeded. Your plan allows {plan.MaxCodesPerMonth} codes per month. You have generated {currentSubscription.CodesGenerated} so far.");
+            return (false,
+                $"Code generation limit exceeded. Your plan allows {plan.MaxCodesPerMonth} codes per month. You have generated {currentSubscription.CodesGenerated} so far.");
         }
 
         return (true, "Permission granted.");
@@ -485,7 +542,8 @@ public class SecurityCodeService : ISecurityCodeService
         var plan = currentSubscription.SubscriptionPlan;
         if (plan == null)
         {
-            _logger.Error("Subscription {SubscriptionId} for brand {BrandId} has no associated plan.", currentSubscription.Id, brandId);
+            _logger.Error("Subscription {SubscriptionId} for brand {BrandId} has no associated plan.",
+                currentSubscription.Id, brandId);
             return (false, "Subscription plan details are missing for the associated brand.");
         }
 
@@ -495,14 +553,12 @@ public class SecurityCodeService : ISecurityCodeService
         {
             // Policy decision: Block the verification or just log/warn?
             // Let's block it for strict enforcement as per subscription model.
-            return (false, $"Verification limit exceeded for the brand. The plan allows {plan.MaxVerificationsPerMonth} verifications per month. This limit has been reached.");
+            return (false,
+                $"Verification limit exceeded for the brand. The plan allows {plan.MaxVerificationsPerMonth} verifications per month. This limit has been reached.");
         }
 
         return (true, "Permission granted.");
     }
-
-
-
 
 
     #region Private Helpers
@@ -536,60 +592,62 @@ public class SecurityCodeService : ISecurityCodeService
         _logger.Information("Logged verification attempt for code '{Code}' with result '{Result}'.", codeAttempted,
             result);
     }
-    
-            public async Task<VerificationTrendDto> GetVerificationTrendForBrandAsync(Guid brandId, DateTime startDate, DateTime endDate)
-        {
-            // Ensure endDate is at the end of the day
-            endDate = endDate.Date.AddDays(1).AddTicks(-1);
 
-            var logsInPeriod = await _verificationLogRepository.GetByDateRangeForBrandAsync(brandId, startDate, endDate);
+    public async Task<VerificationTrendDto> GetVerificationTrendForBrandAsync(Guid brandId, DateTime startDate,
+        DateTime endDate)
+    {
+        // Ensure endDate is at the end of the day
+        endDate = endDate.Date.AddDays(1).AddTicks(-1);
 
-            var dailyCounts = logsInPeriod
-                .GroupBy(log => log.VerificationAttemptedAt.Date)
-                .Select(g => new DailyVerificationCount
-                {
-                    Date = g.Key,
-                    Count = g.Count()
-                })
-                .OrderBy(dvc => dvc.Date)
-                .ToList();
+        var logsInPeriod = await _verificationLogRepository.GetByDateRangeForBrandAsync(brandId, startDate, endDate);
 
-            return new VerificationTrendDto
+        var dailyCounts = logsInPeriod
+            .GroupBy(log => log.VerificationAttemptedAt.Date)
+            .Select(g => new DailyVerificationCount
             {
-                DailyCounts = dailyCounts,
-                TotalVerifications = dailyCounts.Sum(d => d.Count)
-            };
-        }
+                Date = g.Key,
+                Count = g.Count()
+            })
+            .OrderBy(dvc => dvc.Date)
+            .ToList();
 
-        public async Task<IEnumerable<SuspiciousActivityDto>> GetSuspiciousActivitiesForBrandAsync(Guid brandId, int limit = 10)
+        return new VerificationTrendDto
         {
-            // Delegate to the repository method
-            return await _verificationLogRepository.GetSuspiciousActivitiesForBrandAsync(brandId, limit);
-        }
+            DailyCounts = dailyCounts,
+            TotalVerifications = dailyCounts.Sum(d => d.Count)
+        };
+    }
 
-        public async Task<ProductDistributionDto> GetProductDistributionForBrandAsync(Guid brandId)
+    public async Task<IEnumerable<SuspiciousActivityDto>> GetSuspiciousActivitiesForBrandAsync(Guid brandId,
+        int limit = 10)
+    {
+        // Delegate to the repository method
+        return await _verificationLogRepository.GetSuspiciousActivitiesForBrandAsync(brandId, limit);
+    }
+
+    public async Task<ProductDistributionDto> GetProductDistributionForBrandAsync(Guid brandId)
+    {
+        // Delegate to the repository method
+        var topProducts = await _verificationLogRepository.GetTopVerifiedProductsForBrandAsync(brandId, 10);
+
+        // To get the total number of *distinct* products for the brand that have verifications,
+        // we can count the distinct ProductIds from the topProducts list or query the DB.
+        // Using the list is simpler if the limit is reasonable.
+        var totalProductsWithVerifications = topProducts.Select(p => p.ProductId).Distinct().Count();
+
+        // To get the *total* number of products for the brand (regardless of verification),
+        // you would need a method on IProductRepository or IBrandRepository.
+        // var totalProductsForBrand = await _productRepository.CountAsync(p => p.BrandId == brandId);
+        // For now, let's just use the count of products with verifications.
+        // If you need the total distinct products the brand has (even without verifications
+        // showing in top 10), add a method to count them.
+
+        return new ProductDistributionDto
         {
-             // Delegate to the repository method
-            var topProducts = await _verificationLogRepository.GetTopVerifiedProductsForBrandAsync(brandId, 10);
-
-            // To get the total number of *distinct* products for the brand that have verifications,
-            // we can count the distinct ProductIds from the topProducts list or query the DB.
-            // Using the list is simpler if the limit is reasonable.
-            var totalProductsWithVerifications = topProducts.Select(p => p.ProductId).Distinct().Count();
-            
-            // To get the *total* number of products for the brand (regardless of verification),
-            // you would need a method on IProductRepository or IBrandRepository.
-            // var totalProductsForBrand = await _productRepository.CountAsync(p => p.BrandId == brandId);
-            // For now, let's just use the count of products with verifications.
-            // If you need the total distinct products the brand has (even without verifications
-            // showing in top 10), add a method to count them.
-
-            return new ProductDistributionDto
-            {
-                TopProducts = topProducts.ToList(),
-                TotalProducts = totalProductsWithVerifications // Or totalProductsForBrand if method added
-            };
-        }
+            TopProducts = topProducts.ToList(),
+            TotalProducts = totalProductsWithVerifications // Or totalProductsForBrand if method added
+        };
+    }
 
     #endregion
 }
