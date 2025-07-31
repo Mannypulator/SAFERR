@@ -483,4 +483,5 @@ $RECYCLE.BIN/
 # Vim temporary swap files
 *.swp
 
-
+# Ignore launchSettings.json (used by Visual Studio and Rider)
+**/Properties/launchSettings.json

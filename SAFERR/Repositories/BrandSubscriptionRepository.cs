@@ -82,15 +82,22 @@ public class BrandSubscriptionRepository : GenericRepository<BrandSubscription>,
             var cacheKey = $"CurrentSubscription_{subscription.BrandId}";
             _cache.Remove(cacheKey);
             _logger.LogDebug("Cache invalidated for Brand ID {BrandId} due to usage update on Subscription ID {SubscriptionId}.", subscription.BrandId, brandSubscriptionId);
+            
         }
         // -----------------------------------
+        
+        // subscription.CodesGenerated = codesGeneratedDelta;
+        // subscription.VerificationsReceived = verificationsReceivedDelta;
+        // _context.BrandSubscriptions.Update(subscription);
+        // await _context.SaveChangesAsync();
+     
 
-        await _context.Database.ExecuteSqlRawAsync(@"
-                UPDATE BrandSubscriptions
-                SET CodesGenerated = CodesGenerated + {0},
-                    VerificationsReceived = VerificationsReceived + {1}
-                WHERE Id = {2}",
-            codesGeneratedDelta, verificationsReceivedDelta, brandSubscriptionId);
+        // await _context.Database.ExecuteSqlRawAsync(@"
+        //         UPDATE BrandSubscriptions
+        //         SET CodesGenerated = CodesGenerated + {0},
+        //             VerificationsReceived = VerificationsReceived + {1}
+        //         WHERE Id = {2}",
+        //     codesGeneratedDelta, verificationsReceivedDelta, brandSubscriptionId);
     }
 
 }

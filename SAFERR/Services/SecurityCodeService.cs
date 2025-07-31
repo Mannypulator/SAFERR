@@ -297,7 +297,7 @@ public class SecurityCodeService : ISecurityCodeService
         {
             // ... verification logic ...
 
-            if (securityCode.IsVerified)
+            if (securityCode.IsVerified || securityCode.IsApplied)
             {
                 // ... AlreadyVerified logic ...
                 _logger.Information(
@@ -312,7 +312,15 @@ public class SecurityCodeService : ISecurityCodeService
                     securityCode.Id, securityCode.ProductId, brandIdForVerification);
 
                 // ... update code ...
+                securityCode.IsApplied = true;
+                securityCode.IsVerified = true;
+                
+                _securityCodeRepository.Update(securityCode);
+                
                 await _securityCodeRepository.SaveChangesAsync();
+
+                resultDto.Result = VerificationResult.Genuine;
+                resultDto.Message = "Successfully verified the product.";
             }
 
             // ... log verification attempt ...
