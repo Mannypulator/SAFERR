@@ -426,8 +426,8 @@ public class SecurityCodeService : ISecurityCodeService
             else
             {
                 _logger.Warning(
-                    "SMS sending failed or pending for {ToPhoneNumber}. Status: {Status}, ErrorCode: {ErrorCode}",
-                    toPhoneNumber, messageResource.Status, messageResource.ErrorCode);
+                    "SMS sending failed or pending for {ToPhoneNumber}. Status: {Status}, ErrorCode: {ErrorCode}, ErrorMessage: {ErrorMessage}, FullResponse: {Response}",
+                    toPhoneNumber, messageResource.Status, messageResource.ErrorCode, messageResource.ErrorMessage, messageResource.ToString());
                 return false;
             }
         }

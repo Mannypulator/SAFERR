@@ -54,6 +54,12 @@ builder.Services.AddCors(options =>
 
 builder.Configuration.AddEnvironmentVariables();
 
+var accountSid = builder.Configuration["TWILIO_ACCOUNT_SID"];
+var authToken = builder.Configuration["TWILIO_AUTH_TOKEN"];
+
+
+Twilio.TwilioClient.Init(accountSid, authToken);
+
 builder.Services.AddControllers(options =>
 {
     // --- Configure Global Error Handling Filter ---
